@@ -3022,8 +3022,36 @@ pub unsafe fn run_instruction(opcode: i32) { gen::interpreter::run(opcode as u32
 pub unsafe fn run_instruction0f_16(opcode: i32) { gen::interpreter0f::run(opcode as u32) }
 pub unsafe fn run_instruction0f_32(opcode: i32) { gen::interpreter0f::run(opcode as u32 | 0x100) }
 
+unsafe fn do_single_step() {
+    // Execute exactly one instruction via the interpreter (bypassing the JIT),
+    // then deliver a single-step #DB trap. TF is sampled at the start of the
+    // instruction (i.e. here, at the top of the cycle): the instruction that
+    // *sets* TF runs with TF clear at its own start and is not stepped; the
+    // following instruction is. This matches x86 semantics and is why gdb's
+    // iret-into-a-TF-context single-step works without touching the JIT.
+    *previous_ip = *instruction_pointer;
+    let phys_addr = return_on_pagefault!(get_phys_eip());
+    let opcode = *memory::mem8.offset(phys_addr as isize) as i32;
+    *instruction_pointer += 1;
+    run_instruction(opcode | (*is_32 as i32) << 8);
+    *instruction_counter += 1;
+
+    // If the instruction faulted or entered a software interrupt,
+    // call_interrupt_vector has already cleared TF (a handler is entered with TF
+    // clear on real hardware too), so only deliver the trap when TF is still set.
+    if *flags & FLAG_TRAP != 0 {
+        trigger_db_trap();
+    }
+}
+
 pub unsafe fn cycle_internal() {
     profiler::stat_increment(stat::CYCLE_INTERNAL);
+
+    if *flags & FLAG_TRAP != 0 {
+        do_single_step();
+        return;
+    }
+
     let mut jit_entry = None;
     let initial_eip = *instruction_pointer;
     let initial_state_flags = *state_flags;
@@ -3361,6 +3389,21 @@ pub unsafe fn trigger_gp(code: i32) {
         }
     }
     call_interrupt_vector(CPU_EXCEPTION_GP, false, Some(code));
+}
+
+pub unsafe fn trigger_db_trap() {
+    // Single-step debug exception (#DB, vector 1). Unlike a fault this is a trap:
+    // the instruction has completed and instruction_pointer already points at the
+    // next instruction, so (unlike trigger_gp) we do not rewind to previous_ip.
+    // Set DR6.BS (bit 14) so the guest's #DB handler can tell a single-step apart
+    // from a code/data breakpoint. #DB carries no error code.
+    *dreg.offset(6) |= 1 << 14;
+    if DEBUG {
+        if js::cpu_exception_hook(CPU_EXCEPTION_DB) {
+            return;
+        }
+    }
+    call_interrupt_vector(CPU_EXCEPTION_DB, false, None);
 }
 
 #[cold]
@@ -4393,11 +4436,9 @@ pub unsafe fn update_eflags(new_flags: i32) {
     }
     *flags = (new_flags ^ (*flags ^ new_flags) & dont_update) & clear | FLAGS_DEFAULT;
     *flags_changed = 0;
-
-    if *flags & FLAG_TRAP != 0 {
-        dbg_log!("Not supported: trap flag");
-    }
-    *flags &= !FLAG_TRAP;
+    // Note: FLAG_TRAP (single-step) is intentionally preserved here (it is part of
+    // FLAGS_MASK). It is consumed by the single-step check at the top of
+    // cycle_internal, which delivers a #DB trap after the next instruction.
 }
 
 #[no_mangle]
